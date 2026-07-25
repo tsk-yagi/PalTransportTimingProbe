@@ -1,5 +1,5 @@
 local MOD_NAME = "PalTransportTimingProbe"
-local VERSION = "0.1.0"
+local VERSION = "0.2.0"
 local CONFIG_PATH =
     "ue4ss/Mods/PalTransportTimingProbe/Scripts/config.lua"
 
@@ -7,12 +7,12 @@ local TRANSPORT_ASSIGN =
     "/Script/Pal.PalBaseCampModuleTransportItemDirector:OnAssignWorkTransportItemTarget"
 local TRANSPORT_UNASSIGN =
     "/Script/Pal.PalBaseCampModuleTransportItemDirector:OnUnassignWorkTransportItemTarget"
-local ACTION_WRITE_BLACKBOARD =
-    "/Script/Pal.PalActionTransportItem:WriteBlackboard"
-local ACTION_START_SETUP =
-    "/Script/Pal.PalActionTransportItem:StartSetupItemActor"
-local ITEM_MOVE_DELEGATE =
-    "/Script/Pal.PalItemContainerManager:ItemOperationMoveDelegate__DelegateSignature"
+local REQUIREMENT_ASSIGN =
+    "/Script/Pal.PalBaseCampModuleTransportItemDirector:OnAssignWorkRequirement"
+local REQUIREMENT_UNASSIGN =
+    "/Script/Pal.PalBaseCampModuleTransportItemDirector:OnUnassignWorkRequirement"
+local ITEM_MOVE_SERVER_INTERNAL =
+    "/Script/Pal.PalEventNotify_ItemContainer:OnItemOperationMove_ServerInternal"
 local CONTAINER_UPDATE =
     "/Script/Pal.PalBaseCampModuleTransportItemDirector:OnUpdateMapObjectContainer"
 
@@ -37,6 +37,8 @@ end
 
 local INITIAL_DELAY_MS = math.max(0,
     math.floor(tonumber(Config.InitialDelayMs) or 5000))
+local SETTINGS_POLL_INTERVAL_MS = math.max(0,
+    math.floor(tonumber(Config.GameSettingsPollIntervalMs) or 10000))
 local MAX_TRACKED_WORKERS = math.max(1,
     math.floor(tonumber(Config.MaxTrackedWorkers) or 512))
 local MAX_MOVE_OPERATIONS = math.max(1,
@@ -50,8 +52,7 @@ local SUMMARY_INTERVAL = math.max(0,
 
 local LOG_SETTINGS = Config.LogGameSettings ~= false
 local LOG_ASSIGNMENTS = Config.LogAssignments ~= false
-local LOG_ACTION_BLACKBOARD = Config.LogActionBlackboard ~= false
-local LOG_ACTION_SETUP = Config.LogActionSetup ~= false
+local LOG_REQUIREMENTS = Config.LogRequirements ~= false
 local LOG_ITEM_MOVES = Config.LogItemMoves ~= false
 local LOG_UNMATCHED_MOVES = Config.LogUnmatchedItemMoves == true
 local LOG_CONTAINER_UPDATES = Config.LogContainerUpdates ~= false
@@ -61,16 +62,34 @@ local logged_errors = {}
 local gameplay_statics = nil
 local tracked_workers = {}
 local tracked_order = {}
+local last_game_settings = nil
+local settings_missing = false
+
+local GAME_SETTING_NAMES = {
+    "WorkerCollectResourceStackMaxNum",
+    "WorkTransportingDelayTimeDropItem",
+    "WorkTransportingSpeedRate",
+    "WorkTransportingItemNumRateInShouldTeleportWorker",
+    "BaseCampWorkerDistancePickableItem",
+    "DropItemWaitInsertMaxNumPerTick",
+    "MergeDropItemRange",
+    "WorkSuitabilityMaxRank",
+}
 
 local counters = {
     assignments = 0,
     assignment_posts = 0,
-    blackboards = 0,
-    action_setups = 0,
+    assignment_take_out = 0,
+    assignment_put_in = 0,
+    requirement_assignments = 0,
+    requirement_assignment_posts = 0,
+    requirement_take_out = 0,
+    requirement_put_in = 0,
     item_move_events = 0,
     matched_item_moves = 0,
     container_updates = 0,
     unassignments = 0,
+    requirement_unassignments = 0,
 }
 
 local function log_error_once(key, message)
@@ -103,14 +122,6 @@ local function format_number(value)
     value = tonumber(value)
     if value == nil then return "n/a" end
     return ("%.6g"):format(value)
-end
-
-local function value_to_string(value)
-    value = unwrap_hook(value)
-    if value == nil then return "None" end
-    local ok, result = pcall(function() return value:ToString() end)
-    if ok and result ~= nil then return tostring(result) end
-    return tostring(value)
 end
 
 local function format_guid_key(guid)
@@ -189,6 +200,25 @@ local function set_worker_state(key, state)
     end
 end
 
+local function get_or_create_worker_state(key)
+    if key == nil then return nil end
+    local state = tracked_workers[key]
+    if state ~= nil then return state end
+    state = {
+        move_count = 0,
+        target_active = false,
+        requirement_active = false,
+    }
+    set_worker_state(key, state)
+    return state
+end
+
+local function remove_worker_state_if_inactive(key, state)
+    if key == nil or state == nil then return end
+    if state.target_active or state.requirement_active then return end
+    remove_worker_state(key)
+end
+
 local function get_work_assign_info(work_assign)
     work_assign = unwrap_hook(work_assign)
     if not is_valid(work_assign) then return nil end
@@ -231,27 +261,34 @@ local function get_work_assign_info(work_assign)
     }
 end
 
-local function get_action_worker(action)
-    action = unwrap_hook(action)
-    if not is_valid(action) then return nil, "<invalid>" end
-    local ok_parameter, parameter = pcall(function()
-        return action:GetActionIndividualCharacterParameter()
-    end)
-    if not ok_parameter or not is_valid(parameter) then
-        return nil, full_name(action)
-    end
-    local ok_id, individual_id = pcall(function()
-        return parameter:GetPalId()
-    end)
-    local key = ok_id and individual_id_key(individual_id) or nil
-    return key, full_name(parameter)
-end
-
 local function read_property(object, property_name)
     if not is_valid(object) then return nil end
     local ok, value = pcall(function() return object[property_name] end)
     if ok then return value end
     return nil
+end
+
+local function get_transport_type(work)
+    work = unwrap_hook(work)
+    local raw_value = unwrap_hook(read_property(work, "TransportType"))
+    local value = tonumber(raw_value)
+    if value == 0 then return value, "TakeOut" end
+    if value == 1 then return value, "PutIn" end
+
+    local text = tostring(raw_value)
+    if text:find("TakeOut", 1, true) then return 0, "TakeOut" end
+    if text:find("PutIn", 1, true) then return 1, "PutIn" end
+    return value, "Unknown"
+end
+
+local function update_transport_type_counters(prefix, value)
+    if value == 0 then
+        counters[prefix .. "_take_out"] =
+            (counters[prefix .. "_take_out"] or 0) + 1
+    elseif value == 1 then
+        counters[prefix .. "_put_in"] =
+            (counters[prefix .. "_put_in"] or 0) + 1
+    end
 end
 
 local function find_game_setting()
@@ -268,32 +305,53 @@ local function find_game_setting()
     return nil
 end
 
-local function log_game_settings(source)
+local function sample_game_settings(source, force_log)
     if not LOG_SETTINGS then return true end
     local setting = find_game_setting()
     if not is_valid(setting) then
-        log(("[SETTINGS_MISSING] source=%s"):format(tostring(source)))
+        if not settings_missing then
+            settings_missing = true
+            log(("[SETTINGS_MISSING] source=%s"):format(tostring(source)))
+        end
         return false
     end
 
-    local names = {
-        "WorkerCollectResourceStackMaxNum",
-        "WorkTransportingDelayTimeDropItem",
-        "WorkTransportingSpeedRate",
-        "WorkTransportingItemNumRateInShouldTeleportWorker",
-        "BaseCampWorkerDistancePickableItem",
-        "DropItemWaitInsertMaxNumPerTick",
-        "MergeDropItemRange",
-        "WorkSuitabilityMaxRank",
-    }
+    local values = {}
     local parts = {}
-    for _, name in ipairs(names) do
-        parts[#parts + 1] = name .. "=" ..
-            format_number(read_property(setting, name))
+    for _, name in ipairs(GAME_SETTING_NAMES) do
+        values[name] = tonumber(read_property(setting, name))
+        parts[#parts + 1] = name .. "=" .. format_number(values[name])
     end
-    log(("[SETTINGS] source=%s object=%s %s")
-        :format(tostring(source), full_name(setting),
-            table.concat(parts, " ")))
+
+    if settings_missing then
+        settings_missing = false
+        log(("[SETTINGS_RESTORED] source=%s object=%s")
+            :format(tostring(source), full_name(setting)))
+    end
+
+    if force_log or last_game_settings == nil then
+        log(("[SETTINGS] source=%s object=%s %s")
+            :format(tostring(source), full_name(setting),
+                table.concat(parts, " ")))
+    else
+        local changes = {}
+        for _, name in ipairs(GAME_SETTING_NAMES) do
+            local old_value = last_game_settings[name]
+            local new_value = values[name]
+            if old_value ~= new_value then
+                changes[#changes + 1] = name .. "=" ..
+                    format_number(old_value) .. "->" ..
+                    format_number(new_value)
+            end
+        end
+        if #changes > 0 then
+            log(("[SETTINGS_CHANGED] source=%s object=%s %s")
+                :format(tostring(source), full_name(setting),
+                    table.concat(changes, " ")))
+        end
+    end
+
+    last_game_settings = values
     return true
 end
 
@@ -303,19 +361,26 @@ local function maybe_log_summary()
         or counters.assignments % SUMMARY_INTERVAL ~= 0 then
         return
     end
-    log(("[SUMMARY] assignments=%d assignmentPosts=%d " ..
-        "blackboards=%d actionSetups=%d itemMoveEvents=%d " ..
-        "matchedItemMoves=%d containerUpdates=%d unassignments=%d " ..
-        "trackedWorkers=%d")
+    log(("[SUMMARY] targetAssignments=%d targetAssignmentPosts=%d " ..
+        "targetTakeOut=%d targetPutIn=%d requirementAssignments=%d " ..
+        "requirementAssignmentPosts=%d requirementTakeOut=%d " ..
+        "requirementPutIn=%d itemMoveEvents=%d matchedItemMoves=%d " ..
+        "containerUpdates=%d targetUnassignments=%d " ..
+        "requirementUnassignments=%d trackedWorkers=%d")
         :format(
             counters.assignments,
             counters.assignment_posts,
-            counters.blackboards,
-            counters.action_setups,
+            counters.assignment_take_out,
+            counters.assignment_put_in,
+            counters.requirement_assignments,
+            counters.requirement_assignment_posts,
+            counters.requirement_take_out,
+            counters.requirement_put_in,
             counters.item_move_events,
             counters.matched_item_moves,
             counters.container_updates,
             counters.unassignments,
+            counters.requirement_unassignments,
             #tracked_order))
 end
 
@@ -325,29 +390,39 @@ local function on_assign_pre(context_param, work_param, work_assign_param)
         local now = now_ms()
         local info = get_work_assign_info(work_assign_param)
         local work = unwrap_hook(work_param)
+        local transport_type, transport_phase = get_transport_type(work)
+        update_transport_type_counters("assignment", transport_type)
         if info == nil or info.key == nil then
             if LOG_ASSIGNMENTS then
-                log(("[ASSIGN_PRE] tMs=%s worker=<unresolved> work=%s")
-                    :format(format_number(now), full_name(work)))
+                log(("[ASSIGN_PRE] tMs=%s worker=<unresolved> " ..
+                    "transportType=%s transportPhase=%s work=%s")
+                    :format(
+                        format_number(now),
+                        format_number(transport_type),
+                        transport_phase,
+                        full_name(work)))
             end
             return
         end
 
-        set_worker_state(info.key, {
-            assign_ms = now,
-            setup_ms = nil,
-            move_ms = nil,
-            move_count = 0,
-            rank = info.rank,
-            worker_name = info.worker_name,
-        })
+        local state = get_or_create_worker_state(info.key)
+        state.target_assign_ms = now
+        state.target_active = true
+        state.target_transport_type = transport_type
+        state.target_transport_phase = transport_phase
+        state.move_ms = nil
+        state.move_count = 0
+        state.rank = info.rank
+        state.worker_name = info.worker_name
         if LOG_ASSIGNMENTS then
             log(("[ASSIGN_PRE] tMs=%s worker=%s rank=%s " ..
-                "character=%s work=%s")
+                "transportType=%s transportPhase=%s character=%s work=%s")
                 :format(
                     format_number(now),
                     tostring(info.key),
                     format_number(info.rank),
+                    format_number(transport_type),
+                    transport_phase,
                     tostring(info.worker_name),
                     full_name(work)))
         end
@@ -367,11 +442,15 @@ local function on_assign_post(context_param, work_param, work_assign_param)
         local now = now_ms()
         local state = tracked_workers[info.key]
         if LOG_ASSIGNMENTS then
-            log(("[ASSIGN_POST] tMs=%s worker=%s nativeMs=%s")
+            log(("[ASSIGN_POST] tMs=%s worker=%s transportType=%s " ..
+                "transportPhase=%s nativeMs=%s")
                 :format(
                     format_number(now),
                     tostring(info.key),
-                    delta_text(now, state and state.assign_ms)))
+                    format_number(state and state.target_transport_type),
+                    tostring(state and state.target_transport_phase
+                        or "Unknown"),
+                    delta_text(now, state and state.target_assign_ms)))
         end
     end)
     if not ok then
@@ -380,57 +459,84 @@ local function on_assign_post(context_param, work_param, work_assign_param)
     end
 end
 
-local function on_action_blackboard(
-        context_param, blackboard_param, item_id_param)
+local function on_requirement_assign_pre(
+        context_param, work_param, work_assign_param)
     local ok, message = pcall(function()
-        counters.blackboards = counters.blackboards + 1
-        local action = unwrap_hook(context_param)
-        local key, character_name = get_action_worker(action)
+        counters.requirement_assignments =
+            counters.requirement_assignments + 1
         local now = now_ms()
-        local state = key and tracked_workers[key] or nil
-        if LOG_ACTION_BLACKBOARD then
-            log(("[ACTION_BLACKBOARD] tMs=%s worker=%s item=%s " ..
-                "sinceAssignMs=%s character=%s action=%s")
+        local info = get_work_assign_info(work_assign_param)
+        local work = unwrap_hook(work_param)
+        local transport_type, transport_phase = get_transport_type(work)
+        update_transport_type_counters("requirement", transport_type)
+        if info == nil or info.key == nil then
+            if LOG_REQUIREMENTS then
+                log(("[REQUIREMENT_ASSIGN_PRE] tMs=%s " ..
+                    "worker=<unresolved> transportType=%s " ..
+                    "transportPhase=%s work=%s")
+                    :format(
+                        format_number(now),
+                        format_number(transport_type),
+                        transport_phase,
+                        full_name(work)))
+            end
+            return
+        end
+
+        local state = get_or_create_worker_state(info.key)
+        state.requirement_assign_ms = now
+        state.requirement_active = true
+        state.requirement_transport_type = transport_type
+        state.requirement_transport_phase = transport_phase
+        state.rank = info.rank
+        state.worker_name = info.worker_name
+        if LOG_REQUIREMENTS then
+            log(("[REQUIREMENT_ASSIGN_PRE] tMs=%s worker=%s rank=%s " ..
+                "transportType=%s transportPhase=%s character=%s work=%s")
                 :format(
                     format_number(now),
-                    tostring(key or "<unresolved>"),
-                    value_to_string(item_id_param),
-                    delta_text(now, state and state.assign_ms),
-                    tostring(character_name),
-                    full_name(action)))
+                    tostring(info.key),
+                    format_number(info.rank),
+                    format_number(transport_type),
+                    transport_phase,
+                    tostring(info.worker_name),
+                    full_name(work)))
         end
     end)
     if not ok then
-        log_error_once("action-blackboard",
-            "action blackboard hook failed: " .. tostring(message))
+        log_error_once("requirement-assign-pre",
+            "requirement assignment pre-hook failed: " ..
+            tostring(message))
     end
 end
 
-local function on_action_setup(context_param, item_id_param)
+local function on_requirement_assign_post(
+        context_param, work_param, work_assign_param)
     local ok, message = pcall(function()
-        counters.action_setups = counters.action_setups + 1
-        local action = unwrap_hook(context_param)
-        local key, character_name = get_action_worker(action)
+        counters.requirement_assignment_posts =
+            counters.requirement_assignment_posts + 1
+        local info = get_work_assign_info(work_assign_param)
+        if info == nil or info.key == nil then return end
         local now = now_ms()
-        local state = key and tracked_workers[key] or nil
-        if state ~= nil and state.setup_ms == nil then
-            state.setup_ms = now
-        end
-        if LOG_ACTION_SETUP then
-            log(("[ACTION_SETUP] tMs=%s worker=%s item=%s " ..
-                "sinceAssignMs=%s character=%s action=%s")
+        local state = tracked_workers[info.key]
+        if LOG_REQUIREMENTS then
+            log(("[REQUIREMENT_ASSIGN_POST] tMs=%s worker=%s " ..
+                "transportType=%s transportPhase=%s nativeMs=%s")
                 :format(
                     format_number(now),
-                    tostring(key or "<unresolved>"),
-                    value_to_string(item_id_param),
-                    delta_text(now, state and state.assign_ms),
-                    tostring(character_name),
-                    full_name(action)))
+                    tostring(info.key),
+                    format_number(
+                        state and state.requirement_transport_type),
+                    tostring(state and state.requirement_transport_phase
+                        or "Unknown"),
+                    delta_text(
+                        now, state and state.requirement_assign_ms)))
         end
     end)
     if not ok then
-        log_error_once("action-setup",
-            "action setup hook failed: " .. tostring(message))
+        log_error_once("requirement-assign-post",
+            "requirement assignment post-hook failed: " ..
+            tostring(message))
     end
 end
 
@@ -468,14 +574,28 @@ local function on_item_move(context_param, operations_param)
                     state.move_ms = now
                     if LOG_ITEM_MOVES then
                         log(("[ITEM_MOVE] tMs=%s worker=%s operation=%d/%d " ..
-                            "sinceAssignMs=%s sinceSetupMs=%s moveCount=%d")
+                            "targetType=%s targetPhase=%s " ..
+                            "requirementType=%s requirementPhase=%s " ..
+                            "sinceTargetAssignMs=%s " ..
+                            "sinceRequirementAssignMs=%s moveCount=%d")
                             :format(
                                 format_number(now),
                                 tostring(key),
                                 index,
                                 length,
-                                delta_text(now, state.assign_ms),
-                                delta_text(now, state.setup_ms),
+                                format_number(
+                                    state.target_transport_type),
+                                tostring(state.target_transport_phase
+                                    or "Unknown"),
+                                format_number(
+                                    state.requirement_transport_type),
+                                tostring(
+                                    state.requirement_transport_phase
+                                    or "Unknown"),
+                                delta_text(
+                                    now, state.target_assign_ms),
+                                delta_text(
+                                    now, state.requirement_assign_ms),
                                 state.move_count))
                     end
                 end
@@ -519,7 +639,7 @@ local function on_container_update(context_param, module_param)
     end
 end
 
-local function on_unassign(
+local function on_target_unassign(
         context_param, work_param, individual_id_param)
     local ok, message = pcall(function()
         counters.unassignments = counters.unassignments + 1
@@ -527,23 +647,78 @@ local function on_unassign(
         local key = individual_id_key(individual_id)
         local now = now_ms()
         local state = key and tracked_workers[key] or nil
+        local work = unwrap_hook(work_param)
+        local transport_type, transport_phase = get_transport_type(work)
+        if transport_type == nil and state ~= nil then
+            transport_type = state.target_transport_type
+            transport_phase = state.target_transport_phase or "Unknown"
+        end
         if LOG_UNASSIGNMENTS then
-            log(("[UNASSIGN] tMs=%s worker=%s sinceAssignMs=%s " ..
-                "sinceSetupMs=%s sinceMoveMs=%s moveCount=%s work=%s")
+            log(("[UNASSIGN] tMs=%s worker=%s transportType=%s " ..
+                "transportPhase=%s sinceAssignMs=%s sinceMoveMs=%s " ..
+                "moveCount=%s work=%s")
                 :format(
                     format_number(now),
                     tostring(key or "<unresolved>"),
-                    delta_text(now, state and state.assign_ms),
-                    delta_text(now, state and state.setup_ms),
+                    format_number(transport_type),
+                    tostring(transport_phase),
+                    delta_text(now, state and state.target_assign_ms),
                     delta_text(now, state and state.move_ms),
                     tostring(state and state.move_count or 0),
-                    full_name(unwrap_hook(work_param))))
+                    full_name(work)))
         end
-        if key ~= nil then remove_worker_state(key) end
+        if state ~= nil then
+            state.target_active = false
+            remove_worker_state_if_inactive(key, state)
+        end
     end)
     if not ok then
-        log_error_once("unassign",
-            "unassign hook failed: " .. tostring(message))
+        log_error_once("target-unassign",
+            "target unassign hook failed: " .. tostring(message))
+    end
+end
+
+local function on_requirement_unassign(
+        context_param, work_param, individual_id_param)
+    local ok, message = pcall(function()
+        counters.requirement_unassignments =
+            counters.requirement_unassignments + 1
+        local individual_id = unwrap_hook(individual_id_param)
+        local key = individual_id_key(individual_id)
+        local now = now_ms()
+        local state = key and tracked_workers[key] or nil
+        local work = unwrap_hook(work_param)
+        local transport_type, transport_phase = get_transport_type(work)
+        if transport_type == nil and state ~= nil then
+            transport_type = state.requirement_transport_type
+            transport_phase =
+                state.requirement_transport_phase or "Unknown"
+        end
+        if LOG_REQUIREMENTS then
+            log(("[REQUIREMENT_UNASSIGN] tMs=%s worker=%s " ..
+                "transportType=%s transportPhase=%s " ..
+                "sinceRequirementAssignMs=%s sinceTargetAssignMs=%s " ..
+                "sinceMoveMs=%s moveCount=%s work=%s")
+                :format(
+                    format_number(now),
+                    tostring(key or "<unresolved>"),
+                    format_number(transport_type),
+                    tostring(transport_phase),
+                    delta_text(
+                        now, state and state.requirement_assign_ms),
+                    delta_text(now, state and state.target_assign_ms),
+                    delta_text(now, state and state.move_ms),
+                    tostring(state and state.move_count or 0),
+                    full_name(work)))
+        end
+        if state ~= nil then
+            state.requirement_active = false
+            remove_worker_state_if_inactive(key, state)
+        end
+    end)
+    if not ok then
+        log_error_once("requirement-unassign",
+            "requirement unassign hook failed: " .. tostring(message))
     end
 end
 
@@ -569,11 +744,11 @@ local function start()
     if started then return end
     started = true
     ExecuteInGameThread(function()
-        local settings_ok = log_game_settings("startup")
+        local settings_ok = sample_game_settings("startup", true)
         if not settings_ok then
             ExecuteWithDelay(3000, function()
                 ExecuteInGameThread(function()
-                    log_game_settings("startup-retry")
+                    sample_game_settings("startup-retry", true)
                 end)
             end)
         end
@@ -584,18 +759,19 @@ local function start()
             hook_count = hook_count + 1
         end
         if register_hook(TRANSPORT_UNASSIGN,
-            on_unassign) then
+            on_target_unassign) then
             hook_count = hook_count + 1
         end
-        if register_hook(ACTION_WRITE_BLACKBOARD,
-            on_action_blackboard) then
+        if register_hook(REQUIREMENT_ASSIGN,
+            on_requirement_assign_pre,
+            on_requirement_assign_post) then
             hook_count = hook_count + 1
         end
-        if register_hook(ACTION_START_SETUP,
-            on_action_setup) then
+        if register_hook(REQUIREMENT_UNASSIGN,
+            on_requirement_unassign) then
             hook_count = hook_count + 1
         end
-        if register_hook(ITEM_MOVE_DELEGATE,
+        if register_hook(ITEM_MOVE_SERVER_INTERNAL,
             on_item_move) then
             hook_count = hook_count + 1
         end
@@ -605,13 +781,29 @@ local function start()
         end
 
         log(("[STARTED] version=%s hooks=%d readOnly=true " ..
-            "maxTrackedWorkers=%d maxMoveOperations=%d")
+            "settingsPollMs=%d maxTrackedWorkers=%d " ..
+            "maxMoveOperations=%d")
             :format(
                 VERSION,
                 hook_count,
+                SETTINGS_POLL_INTERVAL_MS,
                 MAX_TRACKED_WORKERS,
                 MAX_MOVE_OPERATIONS))
     end)
+
+    if LOG_SETTINGS and SETTINGS_POLL_INTERVAL_MS > 0 then
+        LoopAsync(SETTINGS_POLL_INTERVAL_MS, function()
+            ExecuteInGameThread(function()
+                local ok, message = pcall(
+                    sample_game_settings, "poll", false)
+                if not ok then
+                    log_error_once("settings-poll",
+                        "settings poll failed: " .. tostring(message))
+                end
+            end)
+            return false
+        end)
+    end
 end
 
 ExecuteAsync(function()

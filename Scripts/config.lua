@@ -4,11 +4,13 @@
 return {
     Enabled = true,
     InitialDelayMs = 5000,
+    -- Reacquire UPalGameSetting and compare scalar values every 10 seconds.
+    -- Use 0 to keep only the startup sample.
+    GameSettingsPollIntervalMs = 10000,
 
     LogGameSettings = true,
     LogAssignments = true,
-    LogActionBlackboard = true,
-    LogActionSetup = true,
+    LogRequirements = true,
     LogItemMoves = true,
     LogUnmatchedItemMoves = false,
     LogContainerUpdates = true,

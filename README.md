@@ -13,7 +13,9 @@ save data.
 ### Observed settings
 
 At startup the probe reads and logs these values from the active
-`UPalGameSetting` instance:
+`UPalGameSetting` instance. It then reacquires the active instance every
+`GameSettingsPollIntervalMs` milliseconds (10 seconds by default) and emits
+`SETTINGS_CHANGED` only when one or more values differ:
 
 - `WorkerCollectResourceStackMaxNum`
 - `WorkTransportingDelayTimeDropItem`
@@ -24,21 +26,36 @@ At startup the probe reads and logs these values from the active
 - `MergeDropItemRange`
 - `WorkSuitabilityMaxRank`
 
-Only the values are logged. The `UPalGameSetting` object is not retained.
+Only scalar values are retained for comparison. The `UPalGameSetting` object
+is not retained between samples.
 
 ### Timeline events
 
-- `ASSIGN_PRE` / `ASSIGN_POST`: transport work assignment and native-call time
-- `ACTION_BLACKBOARD`: transported item selected by the transport action
-- `ACTION_SETUP`: carried-item actor setup begins
-- `ITEM_MOVE`: an item-container move matched to the active worker
+- `ASSIGN_PRE` / `ASSIGN_POST`: transport-target assignment and native-call time
+- `REQUIREMENT_ASSIGN_PRE` / `REQUIREMENT_ASSIGN_POST`: transport-requirement
+  assignment and native-call time
+- `ITEM_MOVE`: the concrete server-side item-container move matched to an
+  active worker
 - `CONTAINER_UPDATE`: the transport director received a container update
-- `UNASSIGN`: transport assignment ended
+- `UNASSIGN`: transport-target assignment ended
+- `REQUIREMENT_UNASSIGN`: transport-requirement assignment ended
 - `SUMMARY`: throttled event counters
+
+Each assignment records `UPalWorkTransportItemInBaseCamp.TransportType` as
+both its numeric value and phase name:
+
+- `0`: `TakeOut`
+- `1`: `PutIn`
+
+This allows pickup-side and storage-side durations to be analyzed separately.
+Item moves are observed through
+`UPalEventNotify_ItemContainer:OnItemOperationMove_ServerInternal`, rather
+than the delegate-signature function that did not fire on the dedicated
+server.
 
 Worker correlation uses a string made from `FPalInstanceID.InstanceId`. The
 bounded state cache contains strings, numbers, and timestamps only. It does not
-retain worker, action, work, container, or other UObject references.
+retain worker, work, container, game-setting, or other UObject references.
 
 ### Installation and test
 
@@ -50,7 +67,8 @@ retain worker, action, work, container, or other UObject references.
 6. Disable or remove the probe after the measurement run.
 
 Logging can be reduced in `Scripts/config.lua`. Changes require a server
-restart.
+restart. Set `GameSettingsPollIntervalMs` to `0` to disable periodic setting
+checks while retaining the startup sample.
 
 ## 日本語
 
@@ -63,6 +81,8 @@ Lua診断MODです。`EnhancedBaseLogistics`を変更する前に、取得と収
 ### 観測する設定値
 
 起動時に、有効な`UPalGameSetting`インスタンスから次の値を読み取ってログへ出します。
+その後は`GameSettingsPollIntervalMs`ミリ秒ごと（既定10秒）に有効なインスタンスを
+再取得し、1つ以上の値が変化した場合だけ`SETTINGS_CHANGED`を出力します。
 
 - `WorkerCollectResourceStackMaxNum`
 - `WorkTransportingDelayTimeDropItem`
@@ -73,21 +93,33 @@ Lua診断MODです。`EnhancedBaseLogistics`を変更する前に、取得と収
 - `MergeDropItemRange`
 - `WorkSuitabilityMaxRank`
 
-ログに出すのは値だけです。`UPalGameSetting`オブジェクトは保持しません。
+比較用に保持するのはスカラー値だけです。サンプル間で`UPalGameSetting`
+オブジェクトは保持しません。
 
 ### 時系列イベント
 
-- `ASSIGN_PRE` / `ASSIGN_POST`：運搬作業の割り当てとネイティブ呼び出し時間
-- `ACTION_BLACKBOARD`：運搬アクションが対象アイテムを選択
-- `ACTION_SETUP`：持ち運ぶアイテムActorの準備開始
-- `ITEM_MOVE`：作業パルと対応したアイテムコンテナ移動
+- `ASSIGN_PRE` / `ASSIGN_POST`：運搬対象の割り当てとネイティブ呼び出し時間
+- `REQUIREMENT_ASSIGN_PRE` / `REQUIREMENT_ASSIGN_POST`：運搬Requirementの
+  割り当てとネイティブ呼び出し時間
+- `ITEM_MOVE`：作業パルと対応した、サーバー実処理上のアイテムコンテナ移動
 - `CONTAINER_UPDATE`：運搬Directorがコンテナ更新を受信
-- `UNASSIGN`：運搬割り当て終了
+- `UNASSIGN`：運搬対象の割り当て終了
+- `REQUIREMENT_UNASSIGN`：運搬Requirementの割り当て終了
 - `SUMMARY`：間引いたイベント集計
+
+各割り当てでは`UPalWorkTransportItemInBaseCamp.TransportType`を数値と
+フェーズ名の両方で記録します。
+
+- `0`：`TakeOut`
+- `1`：`PutIn`
+
+これにより、取得側と収納側の所要時間を分けて解析できます。
+アイテム移動は、専用サーバーで発火しなかったDelegate Signatureではなく、
+`UPalEventNotify_ItemContainer:OnItemOperationMove_ServerInternal`で観測します。
 
 作業パルの対応付けには`FPalInstanceID.InstanceId`から作った文字列を使用します。
 上限付き状態キャッシュに保持するのは文字列、数値、時刻だけです。作業パル、
-アクション、作業、コンテナなどのUObject参照は保持しません。
+作業、コンテナ、ゲーム設定などのUObject参照は保持しません。
 
 ### 導入とテスト
 
@@ -99,3 +131,5 @@ Lua診断MODです。`EnhancedBaseLogistics`を変更する前に、取得と収
 6. 計測終了後はProbeを無効化または削除します。
 
 ログ量は`Scripts/config.lua`で減らせます。変更後はサーバー再起動が必要です。
+`GameSettingsPollIntervalMs`を`0`にすると、起動時の取得を残したまま定期確認を
+無効化できます。
